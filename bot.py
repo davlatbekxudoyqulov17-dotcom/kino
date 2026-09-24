@@ -2,6 +2,7 @@ import os
 import asyncio
 import secrets
 import time
+import httpx
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -27,6 +28,7 @@ from database import (
 
 load_dotenv()
 
+
 # ======================== safe_task ========================
 def safe_task(coro):
     """Background tasklarni xavfsiz ishga tushirish va xatolarni log qilish"""
@@ -41,14 +43,13 @@ def safe_task(coro):
 
 
 # ======================== GLOBAL CACHE'LAR (tezlik uchun) ========================
-_mandatory_cache = {"data": None, "timestamp": 0, "ttl": 60}   # 60 soniya
-_ad_cache = {"data": None, "timestamp": 0, "ttl": 120}         # 2 daqiqa
-_last_activity_cache = {}                                       # {user_id: timestamp}
-ACTIVITY_UPDATE_INTERVAL = 300                                  # 5 daqiqa
+_mandatory_cache = {"data": None, "timestamp": 0, "ttl": 60}
+_ad_cache = {"data": None, "timestamp": 0, "ttl": 120}
+_last_activity_cache = {}
+ACTIVITY_UPDATE_INTERVAL = 300
 
 
 async def get_cached_mandatory_subs():
-    """Mandatory subs ro'yxatini 60 soniya cache qiladi"""
     now = time.time()
     if _mandatory_cache["data"] is None or now - _mandatory_cache["timestamp"] > _mandatory_cache["ttl"]:
         _mandatory_cache["data"] = await get_active_mandatory_subs()
@@ -57,13 +58,11 @@ async def get_cached_mandatory_subs():
 
 
 def invalidate_mandatory_cache():
-    """Admin obuna qo'shganda/o'chirganda cache ni tozalash"""
     _mandatory_cache["data"] = None
     _mandatory_cache["timestamp"] = 0
 
 
 async def get_cached_ad():
-    """Reklamani 2 daqiqa cache qiladi"""
     now = time.time()
     if _ad_cache["data"] is None or now - _ad_cache["timestamp"] > _ad_cache["ttl"]:
         _ad_cache["data"] = await get_ad()
@@ -105,7 +104,46 @@ CHANNEL_USERNAME = "@kinomario_kino"
 CHANNEL_URL = "https://t.me/kinomario_kino"
 
 
-# ======================== Middleware: activity tracking (throttle) ========================
+# ======================== SELF-PING (Render uxlamasligi uchun) ========================
+async def self_ping():
+    """Har 1 daqiqada o'z-o'ziga HTTP so'rov yuborib, Render'ni uyg'oq tutadi"""
+    await asyncio.sleep(30)  # Birinchi ping 30 soniyadan keyin
+    ping_count = 0
+    while True:
+        ping_count += 1
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"https://{RENDER_EXTERNAL_HOSTNAME}/healthcheck")
+                print(f"💓 Self-ping #{ping_count}: {resp.status_code} ({time.strftime('%H:%M:%S')})")
+        except Exception as e:
+            print(f"⚠️ Self-ping xatosi #{ping_count}: {e}")
+        
+        await asyncio.sleep(60)  # Har 1 daqiqada
+
+
+# ======================== WEBHOOK WATCHDOG ========================
+async def webhook_watchdog():
+    """Har 4 daqiqada webhook holatini tekshiradi va kerak bo'lsa qayta o'rnatadi"""
+    while True:
+        await asyncio.sleep(240)  # 4 daqiqa
+        try:
+            info = await bot_application.bot.get_webhook_info()
+            
+            if info.pending_update_count > 10 or info.last_error_message:
+                print(f"⚠️ Webhook muammosi: pending={info.pending_update_count}, error={info.last_error_message}")
+                await bot_application.bot.set_webhook(
+                    url=WEBHOOK_URL,
+                    drop_pending_updates=True,
+                    allowed_updates=["message", "callback_query"]
+                )
+                print("✅ Webhook qayta o'rnatildi")
+            else:
+                print(f"💚 Webhook sog'lom: pending={info.pending_update_count} ({time.strftime('%H:%M:%S')})")
+        except Exception as e:
+            print(f"⚠️ Watchdog xatosi: {e}")
+
+
+# ======================== Middleware: activity tracking ========================
 async def track_activity(update: Update, context: CallbackContext):
     """Har qanday update kelganda last_activity ni yangilaydi (5 daqiqada bir marta)"""
     if not update.effective_user:
@@ -385,7 +423,7 @@ async def confirm_all_subs_callback(update: Update, context: CallbackContext):
     for sub in still_incomplete:
         await mark_user_completed_sub(user_id, sub["id"])
 
-    invalidate_mandatory_cache()  # current_count o'zgargan bo'lishi mumkin
+    invalidate_mandatory_cache()
 
     await query.edit_message_text("✅ Ajoyib! Barcha kanallarga obuna bo'lgansiz. Botdan foydalanishingiz mumkin!")
 
@@ -880,7 +918,6 @@ async def handle_code(update: Update, context: CallbackContext):
 
 # ======================== Webhook ========================
 async def safe_process_update(update):
-    """process_update ni xavfsiz ishga tushirish"""
     try:
         await bot_application.process_update(update)
     except Exception as e:
@@ -888,7 +925,6 @@ async def safe_process_update(update):
 
 
 async def webhook_handler(request: Request):
-    """Webhook: Telegram'ga darhol javob qaytaradi, processni background'da davom ettiradi"""
     try:
         data = await request.json()
         update = Update.de_json(data, bot_application.bot)
@@ -899,7 +935,6 @@ async def webhook_handler(request: Request):
 
 
 async def healthcheck(request: Request):
-    """Render + UptimeRobot uchun health check"""
     try:
         bot_username = bot_application.bot.username if bot_application else None
     except Exception:
@@ -1007,7 +1042,7 @@ async def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND & private_filter, handle_code)
     )
 
-    # ======================== Retry bilan initialize (UXLAMASLIK UCHUN) ========================
+    # ======================== Retry bilan initialize ========================
     max_retries = 10
     for attempt in range(1, max_retries + 1):
         try:
@@ -1051,6 +1086,11 @@ async def main():
             print("✅ Webhook xatosiz ishlayapti")
     except Exception as e:
         print(f"⚠️ Webhook info olishda xatolik: {e}")
+
+    # ======================== SELF-PING + WATCHDOG ========================
+    asyncio.create_task(self_ping())
+    asyncio.create_task(webhook_watchdog())
+    print("💓 Self-ping (har 1 daqiqa) va watchdog (har 4 daqiqa) ishga tushdi")
 
     starlette_app = Starlette(debug=False, routes=[
         Route(WEBHOOK_PATH, webhook_handler, methods=["POST"]),
