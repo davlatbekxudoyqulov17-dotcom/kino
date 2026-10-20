@@ -80,7 +80,7 @@ def invalidate_ad_cache():
 PERMANENT_MANDATORY_SUBS = [
     {
         "type": "telegram",
-        "identifier": "@kinolar_olami_botn1",
+        "identifier": "@mpmpmpmp33",
         "limit": 999999,
         "chat_id": None
     }
